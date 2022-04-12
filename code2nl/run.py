@@ -84,9 +84,6 @@ def read_examples(filename):
             code=' '.join(code.strip().split())
             nl=' '.join(js['docstring_tokens']).replace('\n','')
             nl=' '.join(nl.strip().split())
-            print(code)
-            print(nl)
-            exit(0)
             examples.append(
                 Example(
                         idx = idx,
