@@ -21,9 +21,7 @@ using a masked language modeling (MLM) loss.
 
 from __future__ import absolute_import
 import os
-import sys
-import bleu
-import pickle
+import subprocess
 import torch
 import json
 import random
@@ -33,17 +31,22 @@ import numpy as np
 from io import open
 from itertools import cycle
 import torch.nn as nn
-from model import Seq2Seq, Seq2SeqPLBart
+from model import Seq2Seq
 from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (WEIGHTS_NAME, AdamW, get_linear_schedule_with_warmup,
                           RobertaConfig, RobertaModel, RobertaTokenizer,
-                          PLBartConfig, PLBartModel, PLBartTokenizer, PLBartForConditionalGeneration)
-#from calc_code_bleu import calc_codebleu
+                          PLBartConfig, PLBartModel, PLBartTokenizer, PLBartForConditionalGeneration,
+                          EncoderDecoderConfig, EncoderDecoderModel)
+import re
+import shutil
+
+# from calc_code_bleu import calc_codebleu
 
 MODEL_CLASSES = {'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer),
-                 'plbart': (PLBartConfig, PLBartForConditionalGeneration, PLBartTokenizer)}
+                 'plbart': (PLBartConfig, PLBartForConditionalGeneration, PLBartTokenizer),
+                 'codebert_plbart': (RobertaConfig, RobertaModel, RobertaTokenizer)}
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -246,6 +249,13 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
+    parser.add_argument('--num_heads', type=int, default=12,
+                        help="encoder/decoder attention heads")
+    parser.add_argument('--num_layers', type=int, default=6,
+                        help="encoder/decoder layers")
+    parser.add_argument('--codebleu_evaluator', type=str, default='calc_code_bleu.py')
+    parser.add_argument('--ablation',action='store_true',
+                        help='Set this parameter if running ablation')
     # print arguments
     args = parser.parse_args()
     logger.info(args)
@@ -282,11 +292,33 @@ def main():
                         beam_size=args.beam_size, max_length=args.max_target_length,
                         sos_id=tokenizer.cls_token_id, eos_id=tokenizer.sep_token_id)
 
-    elif args.model_type == 'plbart':
-        model = model_class.from_pretrained(args.model_name_or_path)
+    elif args.model_type == 'plbart' and args.ablation:
+        config.encoder_layers = args.num_layers
+        config.decoder_layers = args.num_layers
+        config.encoder_attention_heads = args.num_heads
+        config.decoder_attention_heads = args.num_heads
+        print(config)
+        model = model_class.from_pretrained(args.model_name_or_path, config=config)
         tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, src_lang="en_XX", tgt_lang="java",
                                                     bos_token='<s>', eos_token='</s>', sep_token="concode_elem_sep")
+
         model.resize_token_embeddings(len(tokenizer))
+
+    elif args.model_type == 'plbart':
+        model = model_class.from_pretrained(args.model_name_or_path)
+        tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
+                                                do_lower_case=args.do_lower_case, src_lang="en_XX", tgt_lang="java",
+                                                    bos_token='<s>', eos_token='</s>', sep_token="concode_elem_sep")
+        model.resize_token_embeddings(len(tokenizer))
+
+    elif args.model_type == 'codebert_plbart':
+        decoder = PLBartForConditionalGeneration.from_pretrained('uclanlp/plbart-base').get_decoder()
+        decoder.save_pretrained("./decoder_plbart")
+        tokenizer = PLBartTokenizer.from_pretrained('uclanlp/plbart-base', src_lang="en_XX", tgt_lang="java",
+                                                    bos_token='<s>', eos_token='</s>', sep_token="concode_elem_sep")
+        model = EncoderDecoderModel.from_encoder_decoder_pretrained('microsoft/codebert-base', './decoder_plbart')
+        model.resize_token_embeddings(len(tokenizer))
+
     if args.load_model_path is not None:
         logger.info("reload model from {}".format(args.load_model_path))
         model.load_state_dict(torch.load(args.load_model_path))
@@ -356,7 +388,7 @@ def main():
             if args.model_type == 'roberta':
                 loss, _, _ = model(source_ids=source_ids, source_mask=source_mask, target_ids=target_ids,
                                    target_mask=target_mask)
-            elif args.model_type == 'plbart':
+            elif args.model_type == 'plbart' or args.model_type == 'codebert_plbart':
                 output = model(input_ids=source_ids, attention_mask=source_mask, decoder_input_ids=target_ids,
                                decoder_attention_mask=target_mask)
                 lm_logits = output.logits
@@ -415,7 +447,7 @@ def main():
                         if args.model_type == 'roberta':
                             _, loss, num = model(source_ids=source_ids, source_mask=source_mask,
                                                  target_ids=target_ids, target_mask=target_mask)
-                        elif args.model_type == 'plbart':
+                        elif args.model_type == 'plbart' or args.model_type == 'codebert_plbart':
                             output = model(input_ids=source_ids, attention_mask=source_mask,
                                            decoder_input_ids=target_ids, decoder_attention_mask=target_mask)
                             lm_logits = output.logits
@@ -449,11 +481,14 @@ def main():
                     output_dir = os.path.join(args.output_dir, 'checkpoint-best-ppl')
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-                    output_model_file = os.path.join(output_dir, "pytorch_model.bin")
-                    torch.save(model_to_save.state_dict(), output_model_file)
+                    if args.model_type == 'roberta':
+                        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+                        output_model_file = os.path.join(output_dir, "pytorch_model.bin")
+                        torch.save(model_to_save.state_dict(), output_model_file)
+                    elif args.model_type == 'plbart' or args.model_type == 'codebert_plbart':
+                        model.save_pretrained(output_dir)
 
-                    # Calculate bleu
+                # Calculate code-bleu
                 if 'dev_bleu' in dev_dataset:
                     eval_examples, eval_data = dev_dataset['dev_bleu']
                 else:
@@ -477,20 +512,20 @@ def main():
                         if args.model_type == 'roberta':
                             preds = model(source_ids=source_ids, source_mask=source_mask)
                             for pred in preds:
-                                if args.model_type == 'roberta':
-                                    t = pred[0].cpu().numpy()
-                                    t = list(t)
-                                    if 0 in t:
-                                        t = t[:t.index(0)]
-                                    text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
-                                    p.append(text)
 
-                        elif args.model_type == 'plbart':
-                            #preds = model.generate(source_ids, decoder_start_token_id=tokenizer.lang_code_to_id["java"])
-                            preds = model.generate(source_ids, max_length=args.max_target_length, num_beams=10, temperature=0.7,
-                                                     early_stopping=False, top_k=70, bos_token_id=tokenizer.bos_token_id,
-                                                     eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id)
+                                t = pred[0].cpu().numpy()
+                                t = list(t)
+                                if 0 in t:
+                                    t = t[:t.index(0)]
+                                text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                                p.append(text)
 
+                        elif args.model_type == 'plbart' or args.model_type == 'codebert_plbart':
+                            preds = model.generate(source_ids, max_length=args.max_target_length, num_beams=10,
+                                                   temperature=0.7,
+                                                   early_stopping=False, top_k=70, bos_token_id=tokenizer.bos_token_id,
+                                                   eos_token_id=tokenizer.eos_token_id,
+                                                   pad_token_id=tokenizer.pad_token_id)
                             decoded = tokenizer.batch_decode(preds, skip_special_tokens=True)
                             p.extend(decoded)
 
@@ -503,27 +538,42 @@ def main():
                         f.write(str(gold.idx) + '\t' + ref + '\n')
                         f1.write(str(gold.idx) + '\t' + gold.target + '\n')
 
-                (goldMap, predictionMap) = bleu.computeMaps(predictions, os.path.join(args.output_dir, "dev.gold"))
-                dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
-                logger.info("  %s = %s " % ("bleu-4", str(dev_bleu)))
-                logger.info("  " + "*" * 20)
 
-                # dev_bleu = calc_codebleu("java",[os.path.join(args.output_dir, "dev.gold")], os.path.join(args.output_dir, "dev.output"), 0.25,0.25,0.25,0.25)
-                #
-                # logger.info("  %s = %s " % ("code-bleu", str(dev_bleu)))
-                # logger.info("  " + "*" * 20)
+                regex = re.compile('CodeBLEU score[\\:]\\s+([\\d\\.]+).*')
+                proc = subprocess.Popen(
+                    ['python', args.codebleu_evaluator, '--refs', os.path.join(args.output_dir, 'dev.gold'),
+                     '--hyp', os.path.join(args.output_dir, 'dev.output'), '--lang', 'java',
+                     '--params', '0.25,0.25,0.25,0.25'], stdout=subprocess.PIPE)
+                dev_bleu = 0
+                for line in proc.stdout.readlines():
+                    decoded = line.decode("utf-8")
+                    m = regex.match(decoded)
+                    if m is not None:
+                        dev_bleu = float(m.group(1)) * 100
+
+                logger.info("  %s = %s " % ("code-bleu", str(dev_bleu)))
+                logger.info("  " + "*" * 20)
 
                 if dev_bleu > best_bleu:
                     logger.info("  Best bleu:%s", dev_bleu)
                     logger.info("  " + "*" * 20)
                     best_bleu = dev_bleu
-                    # Save best checkpoint for best bleu
+                    # Save best checkpoint and output files for best bleu
                     output_dir = os.path.join(args.output_dir, 'checkpoint-best-bleu')
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
-                    output_model_file = os.path.join(output_dir, "pytorch_model.bin")
-                    torch.save(model_to_save.state_dict(), output_model_file)
+                    if args.model_type == 'roberta':
+                        model_to_save = model.module if hasattr(model,
+                                                                'module') else model  # Only save the model it-self
+                        output_model_file = os.path.join(output_dir, "pytorch_model.bin")
+                        torch.save(model_to_save.state_dict(), output_model_file)
+                    elif args.model_type == 'plbart' or args.model_type == 'codebert_plbart':
+                        model.save_pretrained(output_dir)
+
+                    shutil.copy(os.path.join(args.output_dir, "dev.gold"),
+                                os.path.join(args.output_dir, 'checkpoint-best-bleu/dev_best.gold'))
+                    shutil.copy(os.path.join(args.output_dir, "dev.output"),
+                                os.path.join(args.output_dir, 'checkpoint-best-bleu/dev_best.output'))
 
     if args.do_test:
         files = []
@@ -552,13 +602,12 @@ def main():
                     if args.model_type == 'roberta':
                         preds = model(source_ids=source_ids, source_mask=source_mask)
                         for pred in preds:
-                            if args.model_type == 'roberta':
-                                t = pred[0].cpu().numpy()
-                                t = list(t)
-                                if 0 in t:
-                                    t = t[:t.index(0)]
-                                text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
-                                p.append(text)
+                            t = pred[0].cpu().numpy()
+                            t = list(t)
+                            if 0 in t:
+                                t = t[:t.index(0)]
+                            text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                            p.append(text)
 
                     elif args.model_type == 'plbart':
                         # preds = model.generate(source_ids, decoder_start_token_id=tokenizer.lang_code_to_id["java"])
@@ -578,14 +627,21 @@ def main():
                     f.write(str(gold.idx) + '\t' + ref + '\n')
                     f1.write(str(gold.idx) + '\t' + gold.target + '\n')
 
-            (goldMap, predictionMap) = bleu.computeMaps(predictions,
-                                                        os.path.join(args.output_dir, "test_{}.gold".format(idx)))
-            dev_bleu = round(bleu.bleuFromMaps(goldMap, predictionMap)[0], 2)
-            logger.info("  %s = %s " % ("bleu-4", str(dev_bleu)))
-            logger.info("  " + "*" * 20)
 
+            regex = re.compile('CodeBLEU score[\\:]\\s+([\\d\\.]+).*')
+            proc = subprocess.Popen(
+                ['python', args.codebleu_evaluator, '--refs', os.path.join(args.output_dir, "test_{}.gold".format(str(idx))),
+                 '--hyp', os.path.join(args.output_dir, "test_{}.output".format(str(idx))), '--lang', 'java',
+                 '--params', '0.25,0.25,0.25,0.25'], stdout=subprocess.PIPE)
+            dev_bleu = 0
+            for line in proc.stdout.readlines():
+                decoded = line.decode("utf-8")
+                m = regex.match(decoded)
+                if m is not None:
+                    dev_bleu = float(m.group(1)) * 100
+
+            logger.info("  %s = %s " % ("code-bleu", str(dev_bleu)))
+            logger.info("  " + "*" * 20)
 
 if __name__ == "__main__":
     main()
-
-

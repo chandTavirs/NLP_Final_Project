@@ -84,9 +84,6 @@ def read_examples(filename):
             code=' '.join(code.strip().split())
             nl=' '.join(js['docstring_tokens']).replace('\n','')
             nl=' '.join(nl.strip().split())
-            print(code)
-            print(nl)
-            exit(0)
             examples.append(
                 Example(
                         idx = idx,
@@ -245,6 +242,15 @@ def main():
                         help="For distributed training: local_rank")   
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
+    parser.add_argument('--d_model',type=int, default=768,
+                        help="embedding size")
+    parser.add_argument('--ffn_dim', type=int, default=3072,
+                        help="feed_forward network size")
+    parser.add_argument('--num_heads', type=int, default=12,
+                        help="encoder/decoder attention heads")
+    parser.add_argument('--num_layers', type=int, default=10,
+                        help="encoder/decoder layers")
+
     # print arguments
     args = parser.parse_args()
     logger.info(args)
@@ -273,15 +279,26 @@ def main():
     
     #budild model
     if args.model_type == 'roberta':
+        config.hidden_size = args.d_model
+        config.intermediate_size = args.ffn_dim
+        config.num_attention_heads = args.num_heads
+        config.num_hidden_layers = args.num_layers
         encoder = model_class.from_pretrained(args.model_name_or_path,config=config)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads)
-        decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=config.hidden_size, nhead=config.num_attention_heads,
+                                                   dim_feedforward=args.ffn_dim)
+        print(config)
+        decoder = nn.TransformerDecoder(decoder_layer, num_layers= 6)
         model=Seq2Seq(encoder=encoder,decoder=decoder,config=config,
                       beam_size=args.beam_size,max_length=args.max_target_length,
                       sos_id=tokenizer.cls_token_id,eos_id=tokenizer.sep_token_id)
 
     elif args.model_type == 'plbart':
-        model = model_class.from_pretrained(args.model_name_or_path)
+        config.encoder_layers = args.num_layers
+        config.decoder_layers = args.num_layers
+        config.encoder_attention_heads = args.num_heads
+        config.decoder_attention_heads = args.num_heads
+        print(config)
+        model = model_class.from_pretrained(args.model_name_or_path, config=config)
         src_lang = args.train_filename.split('/')[-2]
         tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, src_lang=src_lang, tgt_lang="en_XX")
 
@@ -478,15 +495,14 @@ def main():
                         if args.model_type == 'roberta':
                             preds = model(source_ids=source_ids,source_mask=source_mask)
                             for pred in preds:
-                                if args.model_type == 'roberta':
-                                    t = pred[0].cpu().numpy()
-                                    t = list(t)
-                                    if 0 in t:
-                                        t = t[:t.index(0)]
-                                    text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
-                                    p.append(text)
-                                elif args.model_type == 'plbart':
-                                    t = pred.cpu().numpy()
+
+                                t = pred[0].cpu().numpy()
+                                t = list(t)
+                                if 0 in t:
+                                    t = t[:t.index(0)]
+                                text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                                p.append(text)
+
                         elif args.model_type == 'plbart':
                             preds = model.generate(source_ids,decoder_start_token_id=tokenizer.lang_code_to_id["en_XX"])
                             p.extend(tokenizer.batch_decode(preds, skip_special_tokens=True))
@@ -538,16 +554,22 @@ def main():
             p=[]
             for batch in tqdm(eval_dataloader,total=len(eval_dataloader)):
                 batch = tuple(t.to(device) for t in batch)
-                source_ids,source_mask= batch                  
+                source_ids,source_mask= batch
                 with torch.no_grad():
-                    preds = model(source_ids=source_ids,source_mask=source_mask)  
-                    for pred in preds:
-                        t=pred[0].cpu().numpy()
-                        t=list(t)
-                        if 0 in t:
-                            t=t[:t.index(0)]
-                        text = tokenizer.decode(t,clean_up_tokenization_spaces=False)
-                        p.append(text)
+                    if args.model_type == 'roberta':
+                        preds = model(source_ids=source_ids, source_mask=source_mask)
+                        for pred in preds:
+
+                            t = pred[0].cpu().numpy()
+                            t = list(t)
+                            if 0 in t:
+                                t = t[:t.index(0)]
+                            text = tokenizer.decode(t, clean_up_tokenization_spaces=False)
+                            p.append(text)
+
+                    elif args.model_type == 'plbart':
+                        preds = model.generate(source_ids, decoder_start_token_id=tokenizer.lang_code_to_id["en_XX"])
+                        p.extend(tokenizer.batch_decode(preds, skip_special_tokens=True))
             model.train()
             predictions=[]
             with open(os.path.join(args.output_dir,"test_{}.output".format(str(idx))),'w') as f, open(os.path.join(args.output_dir,"test_{}.gold".format(str(idx))),'w') as f1:

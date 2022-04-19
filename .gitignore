@@ -3,3 +3,6 @@
 /nl2code/model/
 /nl2code/data/
 .idea
+*ipynb*
+*pycache*
+code2nl/logs
