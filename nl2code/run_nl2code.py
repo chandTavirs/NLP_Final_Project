@@ -317,7 +317,8 @@ def main():
         tokenizer = PLBartTokenizer.from_pretrained('uclanlp/plbart-base', src_lang="en_XX", tgt_lang="java",
                                                     bos_token='<s>', eos_token='</s>', sep_token="concode_elem_sep")
         model = EncoderDecoderModel.from_encoder_decoder_pretrained('microsoft/codebert-base', './decoder_plbart')
-        model.resize_token_embeddings(len(tokenizer))
+        model.encoder.resize_token_embeddings(len(tokenizer))
+        model.encoder.resize_token_embeddings(len(tokenizer))
 
     if args.load_model_path is not None:
         logger.info("reload model from {}".format(args.load_model_path))

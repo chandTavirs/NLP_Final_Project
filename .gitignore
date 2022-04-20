@@ -6,3 +6,6 @@
 *ipynb*
 *pycache*
 code2nl/logs
+nl2code/logs
+config.json
+*.bin
